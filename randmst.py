@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-import sys
+from __future__ import annotations
+
+import argparse
 import math
-import random
-from typing import List, Tuple
+
+from numpy.random import Generator, default_rng
 
 from mst import kruskal_mst_weight
 from generators import (
@@ -11,65 +13,58 @@ from generators import (
     gen_edges_euclid_sparse,
 )
 
-def run_trial(n: int, dim: int, rng: random.Random) -> float:
-    """
-    Returns MST total weight for one random instance.
-    Uses sparsification for dim in {0,2,3,4}. Exact for dim=1.
-    """
+_VALID_DIMS = frozenset({0, 1, 2, 3, 4})
+_TRIAL_SEED_STRIDE = 1_000_003
+
+
+def run_trial(n: int, dim: int, rng: Generator) -> float:
+    """Uses threshold-retry sparsification for dims 0, 2, 3, 4."""
     if dim == 0:
-        # Sparse Erdos-Renyi style generation with weights in [0, t]
-        # We try increasing constants until the sparse graph is connected enough for MST.
         for c in (2.0, 3.0, 4.0, 6.0, 8.0):
-            t = c * math.log(max(n, 2)) / n
-            t = min(t, 1.0)
-            edges = gen_edges_dim0_sparse(n, t, rng)
-            w = kruskal_mst_weight(n, edges)
+            t = min(c * math.log(max(n, 2)) / n, 1.0)
+            w = kruskal_mst_weight(n, gen_edges_dim0_sparse(n, t, rng))
             if w is not None:
                 return w
-        # Fallback: if something went wrong, last attempt result (or raise)
-        raise RuntimeError("Failed to build connected-enough sparse graph for dim=0")
+        raise RuntimeError(f"dim=0 graph disconnected after all thresholds (n={n})")
 
     if dim == 1:
-        edges = gen_edges_dim1_hypercube(n, rng)
-        w = kruskal_mst_weight(n, edges)
+        w = kruskal_mst_weight(n, gen_edges_dim1_hypercube(n, rng))
         if w is None:
-            raise RuntimeError("Hypercube graph unexpectedly disconnected.")
+            raise RuntimeError(f"dim=1 hypercube unexpectedly disconnected (n={n})")
         return w
 
-    if dim in (2, 3, 4):
-        # Points in unit hypercube; keep edges within radius r.
-        for c in (1.5, 2.0, 3.0, 4.0, 6.0):
-            r = c * (math.log(max(n, 2)) / n) ** (1.0 / dim)
-            edges = gen_edges_euclid_sparse(n, dim, r, rng)
-            w = kruskal_mst_weight(n, edges)
-            if w is not None:
-                return w
-        raise RuntimeError(f"Failed to build connected-enough sparse graph for dim={dim}")
+    for c in (1.5, 2.0, 3.0, 4.0, 6.0):
+        r = c * (math.log(max(n, 2)) / n) ** (1.0 / dim)
+        w = kruskal_mst_weight(n, gen_edges_euclid_sparse(n, dim, r, rng))
+        if w is not None:
+            return w
+    raise RuntimeError(f"dim={dim} graph disconnected after all radii (n={n})")
 
-    raise ValueError("dimension must be 0,1,2,3,4")
 
-def main():
-    # Recommended interface in the handout:
-    # ./randmst 0 numpoints numtrials dimension
-    # output: average numpoints numtrials dimension
-    if len(sys.argv) != 5:
-        print("usage: ./randmst 0 numpoints numtrials dimension", file=sys.stderr)
-        sys.exit(2)
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Average MST weight over independent random trials."
+    )
+    parser.add_argument("seed", type=int, help="Master RNG seed")
+    parser.add_argument("n", type=int, help="Number of vertices")
+    parser.add_argument("trials", type=int, help="Number of independent trials")
+    parser.add_argument(
+        "dimension",
+        type=int,
+        choices=sorted(_VALID_DIMS),
+        metavar="dimension",
+        help="Graph model: 0=complete, 1=hypercube, 2–4=Euclidean",
+    )
+    args = parser.parse_args()
 
-    _flag = int(sys.argv[1])
-    n = int(sys.argv[2])
-    trials = int(sys.argv[3])
-    dim = int(sys.argv[4])
-
-    # Independent randomness per trial: seed from system randomness
-    base = random.SystemRandom().randrange(1 << 60)
     total = 0.0
-    for t in range(trials):
-        rng = random.Random(base + 1000003 * t)
-        total += run_trial(n, dim, rng)
+    for t in range(args.trials):
+        rng = default_rng(args.seed + t * _TRIAL_SEED_STRIDE)
+        total += run_trial(args.n, args.dimension, rng)
 
-    avg = total / trials
-    print(f"{avg:.10f} {n} {trials} {dim}")
+    avg = total / args.trials
+    print(f"{avg:.6f} {args.n} {args.trials} {args.dimension}")
+
 
 if __name__ == "__main__":
     main()
