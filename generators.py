@@ -1,101 +1,81 @@
+from __future__ import annotations
+
+import itertools
 import math
-import random
-from typing import List, Tuple, Dict
 
-Edge = Tuple[int, int, float]
+import numpy as np
+from numpy.random import Generator
 
-def gen_edges_dim0_sparse(n: int, t: float, rng: random.Random) -> List[Edge]:
+Edge = tuple[float, int, int]  # (weight, u, v)
+
+
+def gen_edges_dim0_sparse(n: int, t: float, rng: Generator) -> list[Edge]:
     """
-    Complete graph with i.i.d. U[0,1] weights, but we keep only edges with weight <= t.
-    Equivalent: include each pair with prob p=t, and assign weight uniform in [0,t].
-    We generate edges in expected O(m) time using geometric skipping for Bernoulli(p).
+    Complete graph with i.i.d. U[0,1] weights; keep only edges with weight <= t.
+    Inclusion probability equals t; kept weights are U[0, t].
+    Allocates all n*(n-1)/2 weights at once, then masks.
     """
-    if t <= 0.0:
+    if t <= 0.0 or n < 2:
         return []
-    p = min(max(t, 0.0), 1.0)
-    log_q = math.log(1.0 - p)  # negative
+    t = min(t, 1.0)
+    rows, cols = np.triu_indices(n, k=1)   # one allocation: all pairs
+    weights = rng.random(len(rows))         # one allocation: all weights
+    mask = weights <= t
+    w_m = weights[mask]
+    r_m = rows[mask]
+    c_m = cols[mask]
+    return [(float(w), int(u), int(v)) for w, u, v in zip(w_m, r_m, c_m)]
 
-    edges: List[Edge] = []
-    for i in range(n - 1):
-        j = i + 1
-        while j < n:
-            # geometric skip: number of failures before next success
-            u = rng.random()
-            skip = int(math.floor(math.log(u) / log_q))  # >= 0
-            j += skip
-            if j < n:
-                w = rng.random() * t
-                edges.append((i, j, w))
-                j += 1
-    return edges
 
-def gen_edges_dim1_hypercube(n: int, rng: random.Random) -> List[Edge]:
+def gen_edges_dim1_hypercube(n: int, rng: Generator) -> list[Edge]:
     """
-    Graph on vertices 0..n-1 with edges (a,b) iff |a-b| is a power of 2.
-    Undirected: we add each edge once with a < b.
-    Weight ~ U[0,1].
+    Edges (a, b) where |a - b| is a power of 2 and a < b. Weights i.i.d. U[0,1].
     """
-    edges: List[Edge] = []
-    max_pow = int(math.floor(math.log2(max(n - 1, 1))))
-    for a in range(n):
-        for k in range(max_pow + 1):
-            step = 1 << k
-            b = a + step
-            if b < n:
-                edges.append((a, b, rng.random()))
-    return edges
-
-def gen_edges_euclid_sparse(n: int, dim: int, r: float, rng: random.Random) -> List[Edge]:
-    """
-    Points uniform in [0,1]^dim, complete graph with weights as Euclidean distance.
-    We keep only edges with distance <= r using grid bucketing with cell size r.
-    """
-    pts = [[rng.random() for _ in range(dim)] for _ in range(n)]
-    if r <= 0.0:
+    if n < 2:
         return []
+    max_pow = int(math.floor(math.log2(n - 1)))
+    pairs = [
+        (a, a + (1 << k))
+        for a in range(n)
+        for k in range(max_pow + 1)
+        if a + (1 << k) < n
+    ]
+    weights = rng.random(len(pairs))  # one allocation
+    return [(float(w), a, b) for w, (a, b) in zip(weights, pairs)]
 
-    cell = r
-    # Map from integer cell coords to list of point indices
-    buckets: Dict[Tuple[int, ...], List[int]] = {}
 
-    def cell_id(p):
-        return tuple(int(p[d] // cell) for d in range(dim))
+def gen_edges_euclid_sparse(n: int, dim: int, r: float, rng: Generator) -> list[Edge]:
+    """
+    n points uniform in [0,1]^dim; keep edges whose Euclidean distance is <= r.
+    Uses grid bucketing (cell size r) to avoid checking all O(n^2) pairs.
+    """
+    if r <= 0.0 or n < 2:
+        return []
+    pts: np.ndarray = rng.random((n, dim))  # one allocation: all points
 
-    for i, p in enumerate(pts):
-        cid = cell_id(p)
+    cell_coords = (pts // r).astype(np.int32)
+    buckets: dict[tuple[int, ...], list[int]] = {}
+    for i in range(n):
+        cid = tuple(cell_coords[i].tolist())
         buckets.setdefault(cid, []).append(i)
 
-    # Neighboring cells: all offsets in {-1,0,1}^dim
-    offsets = []
-    def gen_offsets(curr):
-        if len(curr) == dim:
-            offsets.append(tuple(curr))
-            return
-        for v in (-1, 0, 1):
-            curr.append(v)
-            gen_offsets(curr)
-            curr.pop()
-    gen_offsets([])
+    offsets = list(itertools.product((-1, 0, 1), repeat=dim))
+    r_sq = r * r
 
-    edges: List[Edge] = []
+    edges: list[Edge] = []
     for cid, idxs in buckets.items():
         for off in offsets:
-            nid = tuple(cid[d] + off[d] for d in range(dim))
+            nid = tuple(c + o for c, o in zip(cid, off))
             if nid not in buckets:
                 continue
             js = buckets[nid]
-            # To avoid double counting, only generate edges (i,j) with i < j
             for i in idxs:
-                for j in js:
-                    if j <= i:
-                        continue
-                    # compute distance
-                    dist2 = 0.0
-                    pi = pts[i]
-                    pj = pts[j]
-                    for d in range(dim):
-                        diff = pi[d] - pj[d]
-                        dist2 += diff * diff
-                    if dist2 <= r * r:
-                        edges.append((i, j, math.sqrt(dist2)))
+                js_gt = [j for j in js if j > i]
+                if not js_gt:
+                    continue
+                diff = pts[i] - pts[js_gt]          # (k, dim) — vectorized
+                dist_sq = (diff * diff).sum(axis=1)  # (k,)
+                for idx, j in enumerate(js_gt):
+                    if dist_sq[idx] <= r_sq:
+                        edges.append((float(dist_sq[idx] ** 0.5), i, j))
     return edges
